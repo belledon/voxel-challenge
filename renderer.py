@@ -10,7 +10,8 @@ DIS_LIMIT = 100
 
 @ti.data_oriented
 class Renderer:
-    def __init__(self, dx, image_res, up, voxel_edges, exposure=3):
+    def __init__(self, voxel_grid_res, image_res, up, voxel_edges,
+                 exposure=3):
         self.image_res = image_res
         self.aspect_ratio = image_res[0] / image_res[1]
         self.vignette_strength = 0.9
@@ -22,7 +23,7 @@ class Renderer:
         self.bbox = ti.Vector.field(3, dtype=ti.f32, shape=2)
         self.fov = ti.field(dtype=ti.f32, shape=())
         self.voxel_color = ti.Vector.field(3, dtype=ti.u8)
-        self.voxel_material = ti.field(dtype=ti.i8)
+        self.voxel_material = ti.field(dtype=ti.f32)
 
         self.light_direction = ti.Vector.field(3, dtype=ti.f32, shape=())
         self.light_direction_noise = ti.field(dtype=ti.f32, shape=())
@@ -43,10 +44,10 @@ class Renderer:
 
         self.background_color = ti.Vector.field(3, dtype=ti.f32, shape=())
 
-        self.voxel_dx = dx
-        self.voxel_inv_dx = 1 / dx
+        self.voxel_grid_res = voxel_grid_res
+        self.voxel_dx = 2 / voxel_grid_res
+        self.voxel_inv_dx = 1 / self.voxel_dx
         # Note that voxel_inv_dx == voxel_grid_res iff the box has width = 1
-        self.voxel_grid_res = 128
         voxel_grid_offset = [-self.voxel_grid_res // 2 for _ in range(3)]
 
         ti.root.dense(ti.ij, image_res).place(self.color_buffer)
@@ -78,6 +79,11 @@ class Renderer:
         ) < self.voxel_grid_res // 2
 
     @ti.func
+    def unsafe_query_density(self, ipos):
+        ret = self.voxel_material[ipos]
+        return ret
+
+    @ti.func
     def query_density(self, ipos):
         inside = self.inside_grid(ipos)
         ret = 0.0
@@ -95,9 +101,9 @@ class Renderer:
 
     @ti.func
     def voxel_surface_color(self, pos):
+        # REVIEW: relative position within voxel?
         p = pos * self.voxel_inv_dx
         p -= ti.floor(p)
-        voxel_index = self._to_voxel_index(pos)
 
         boundary = self.voxel_edges
         count = 0
@@ -105,10 +111,12 @@ class Renderer:
             if p[i] < boundary or p[i] > 1 - boundary:
                 count += 1
 
+        # REVIEW: only used for edge highlighting?
         f = 0.0
         if count >= 2:
             f = 1.0
 
+        voxel_index = self._to_voxel_index(pos)
         voxel_color = ti.Vector([0.0, 0.0, 0.0])
         is_light = 0
         if self.inside_particle_grid(voxel_index):
@@ -164,14 +172,18 @@ class Renderer:
             ipos = int(ti.floor(o))
             dis = (ipos - o + 0.5 + rsign * 0.5) * rinv
             running = 1
-            i = 0
+            # i = 0 # REVIEW: What is this used for?
             hit_pos = ti.Vector([0.0, 0.0, 0.0])
             while running:
-                last_sample = int(self.query_density(ipos))
+                # outside range of set voxels
                 if not self.inside_particle_grid(ipos):
                     running = 0
 
-                if last_sample:
+                # returns material (1, 2) or 0 if empty voxel
+                # NOTE: `unsafe` ok because `inside_particle_grid`
+                collided = ti.random() < self.unsafe_query_density(ipos)
+
+                if collided:
                     mini = (ipos - o + ti.Vector([0.5, 0.5, 0.5]) -
                             rsign * 0.5) * rinv
                     hit_distance = mini.max() * self.voxel_dx + near
@@ -190,7 +202,7 @@ class Renderer:
                     dis += mm * rsign * rinv
                     ipos += mm * rsign
                     normal = -mm * rsign
-                i += 1
+                # i += 1 # see above
         return hit_distance, normal, c, hit_light, voxel_index
 
     @ti.func
@@ -208,20 +220,22 @@ class Renderer:
         hit_light = 0
         closest, normal, c, hit_light, vx_idx = self.dda_voxel(pos, d)
 
+        # REVIEW: I think this is to collide with the floor
         ray_march_dist = self.ray_march(pos, d)
         if ray_march_dist < DIS_LIMIT and ray_march_dist < closest:
             closest = ray_march_dist
             normal = self.sdf_normal(pos + d * closest)
             c = self.sdf_color(pos + d * closest)
 
+        # REVIEW: is this used?
         # Highlight the selected voxel
-        if self.cast_voxel_hit[None]:
-            cast_vx_idx = self.cast_voxel_index[None]
-            if all(cast_vx_idx == vx_idx):
-                c = ti.Vector([1.0, 0.65, 0.0])
-                # For light sources, we actually invert the material to make it
-                # more obvious
-                hit_light = 1 - hit_light
+        # if self.cast_voxel_hit[None]:
+        #     cast_vx_idx = self.cast_voxel_index[None]
+        #     if all(cast_vx_idx == vx_idx):
+        #         c = ti.Vector([1.0, 0.65, 0.0])
+        #         # For light sources, we actually invert the material to make it
+        #         # more obvious
+        #         hit_light = 1 - hit_light
         return closest, normal, c, hit_light
 
     @ti.kernel
@@ -273,6 +287,8 @@ class Renderer:
                 depth += 1
                 closest, normal, c, hit_light = self.next_hit(pos, d, t)
                 hit_pos = pos + closest * d
+
+                # bounce ray off voxel
                 if not hit_light and normal.norm() != 0 and closest < 1e8:
                     d = out_dir(normal)
                     pos = hit_pos + 1e-4 * d
@@ -373,7 +389,7 @@ class Renderer:
 
     @ti.func
     def set_voxel(self, idx, mat, color):
-        self.voxel_material[idx] = ti.cast(mat, ti.i8)
+        self.voxel_material[idx] = ti.cast(mat, ti.f32)
         self.voxel_color[idx] = self.to_vec3u(color)
 
     @ti.func

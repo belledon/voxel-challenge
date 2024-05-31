@@ -56,6 +56,7 @@ class Camera:
         out_dir = self._lookat_pos - self._camera_pos
         leftdir = self._compute_left_dir(np_normalize(out_dir))
 
+        # REVIEW: what does `3` mean?
         scale = 3
         rotx = np_rotate_matrix(self._up, dx * scale)
         roty = np_rotate_matrix(leftdir, dy * scale)
@@ -111,14 +112,15 @@ class Camera:
 
 
 class Scene:
-    def __init__(self, voxel_edges=0.06, exposure=3):
-        ti.init(arch=ti.vulkan)
+    def __init__(self, voxel_edges=0.06, exposure=3,
+                 voxel_grid_res = 128):
+        ti.init(arch=ti.cuda)
         print(HELP_MSG)
         self.window = ti.ui.Window("Taichi Voxel Renderer",
                                    SCREEN_RES,
                                    vsync=True)
         self.camera = Camera(self.window, up=UP_DIR)
-        self.renderer = Renderer(dx=VOXEL_DX,
+        self.renderer = Renderer(voxel_grid_res, # VOXEL_DX,
                                  image_res=SCREEN_RES,
                                  up=UP_DIR,
                                  voxel_edges=voxel_edges,
